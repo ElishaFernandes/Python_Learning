@@ -1,0 +1,496 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+
+from scipy.stats import shapiro, jarque_bera, skew, kurtosis, probplot
+from statsmodels.tsa.stattools import acf, adfuller   # adfuller uses maxlag (no s)
+
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+PALETTE = ["#2196F3", "#FF5722", "#4CAF50", "#9C27B0", "#FF9800"]
+plt.rcParams.update({
+    "figure.dpi": 120,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+# Configuration
+
+@dataclass
+class ProjectConfig:
+    tickers: List[str] = field(default_factory=lambda: [
+        "^GSPC",    # S&P 500
+        "^IXIC",    # NASDAQ Composite
+        "VUAG.L",   # Vanguard FTSE All-World UCITS ETF (LSE)
+    ])
+    ticker_labels: Dict[str, str] = field(default_factory=lambda: {
+        "^GSPC":  "S&P 500",
+        "^IXIC":  "NASDAQ",
+        "VUAG.L": "VUAG",
+    })
+    start_date:         str   = "2015-01-01"
+    end_date:           str   = "2024-12-31"
+    n_scenarios:        int   = 500
+    steps_per_year:     int   = 252
+    n_years_sim:        float = 1.0
+    prediction_horizon: int   = 5
+    train_window:       int   = 252
+    transaction_cost:   float = 0.0010
+    signal_threshold:   float = 0.0
+    seed:               int   = 42
+
+
+CFG = ProjectConfig()
+np.random.seed(CFG.seed)
+
+# Data Acquisition
+
+def download_prices(tickers, start, end):
+    raw    = yf.download(tickers, start=start, end=end,
+                         auto_adjust=True, progress=False)
+    prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+    prices = prices.ffill(limit=2)
+    prices = prices.dropna(thresh=max(1, len(tickers) // 2))
+    prices.rename(columns=CFG.ticker_labels, inplace=True)
+    return prices
+
+
+def compute_returns(prices):
+    simple = prices.pct_change().dropna()
+    log    = np.log(prices / prices.shift(1)).dropna()
+    return simple, log
+
+
+def data_summary(prices, log_returns):
+    ann = 252
+    df  = pd.DataFrame({
+        "Obs":             len(prices),
+        "Ann. Return (%)": (log_returns.mean() * ann * 100).round(2),
+        "Ann. Vol (%)":    (log_returns.std()  * np.sqrt(ann) * 100).round(2),
+        "Skewness":        log_returns.apply(skew).round(3),
+        "Excess Kurt":     log_returns.apply(kurtosis).round(3),
+    })
+    print("\n-- Phase A: Data Summary -------------------------------------------")
+    print(df.to_string())
+
+
+# Geometric Brownian Motion
+
+def gbm_engine(s_0, mu, sigma, n_years, n_scenarios, steps_per_year=252):
+    dt      = 1 / steps_per_year
+    n_steps = int(n_years * steps_per_year)
+    Z       = np.random.standard_normal(size=(n_steps, n_scenarios))
+    log_r   = (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * Z
+    rets_p1 = np.exp(log_r)
+    rets_p1 = np.vstack([np.ones((1, n_scenarios)), rets_p1])
+    return s_0 * pd.DataFrame(rets_p1).cumprod(axis=0)
+
+
+def estimate_gbm_params(log_returns, ann=252):
+    sigma = log_returns.std()  * np.sqrt(ann)
+    mu    = log_returns.mean() * ann + 0.5 * sigma**2
+    return mu, sigma
+
+
+def plot_gbm_all_assets(simulations):
+    n   = len(simulations)
+    fig = plt.figure(figsize=(18, 6 * n))
+
+    for i, sim in enumerate(simulations):
+        paths    = sim["price_paths"]
+        name     = sim["asset_name"]
+        s_0      = sim["s_0"]
+        mu       = sim["mu"]
+        sigma    = sim["sigma"]
+        terminal = paths.iloc[-1]
+
+        ax_path = fig.add_subplot(n, 2, 2 * i + 1)
+        ax_hist = fig.add_subplot(n, 2, 2 * i + 2, sharey=ax_path)
+
+        # Monte Carlo paths
+        paths.plot(ax=ax_path, legend=False,
+                   color="steelblue", alpha=0.06, lw=0.5)
+        ax_path.axhline(s_0, color="black", lw=1.4, ls="--", label="Start")
+        ax_path.axhline(terminal.mean(), color="red", lw=1.6, ls="-",
+                        label=f"Mean: {terminal.mean():.2f}")
+        ax_path.set_title(
+            f"{name} -- Monte Carlo  (mu={mu:.1%}, sigma={sigma:.1%})",
+            fontsize=12)
+        ax_path.set_xlabel("Trading Days")
+        ax_path.set_ylabel("Price")
+        ax_path.legend(fontsize=9)
+
+        # Terminal wealth histogram (horizontal, shares y with paths)
+        ax_hist.hist(terminal, bins=60, orientation="horizontal",
+                     color="steelblue", edgecolor="white", alpha=0.85)
+        ax_hist.axhline(terminal.mean(),
+                        color="red",    lw=1.5, ls="-",  label="Mean")
+        ax_hist.axhline(terminal.median(),
+                        color="orange", lw=1.2, ls="--", label="Median")
+        ax_hist.set_title(f"{name} -- Terminal Wealth", fontsize=12)
+        ax_hist.set_xlabel("Scenarios")
+        ax_hist.yaxis.tick_right()
+        plt.setp(ax_hist.get_yticklabels(), visible=False)
+        ax_hist.legend(fontsize=9)
+
+    fig.suptitle("GBM Monte Carlo -- All Assets", fontsize=16, y=1.005)
+    plt.tight_layout()
+    plt.savefig("gbm_all_assets.png", bbox_inches="tight")
+    plt.show()
+    print("  Saved: gbm_all_assets.png")
+
+# Diagnostics
+
+def run_diagnostics(log_returns):
+    print("\n-- Phase C: Empirical Diagnostics ----------------------------------")
+    results = {}
+    for col in log_returns.columns:
+        r       = log_returns[col].dropna()
+        _, sw_p = shapiro(r.sample(min(len(r), 5000), random_state=CFG.seed))
+        _, jb_p = jarque_bera(r)[:2]
+        adf_p   = adfuller(r, maxlag=10)[1]   # maxlag not maxlags
+        results[col] = {
+            "Shapiro p":   round(sw_p,  4),
+            "JB p":        round(jb_p,  4),
+            "ADF p":       round(adf_p, 4),
+            "Skewness":    round(float(skew(r)),     3),
+            "Excess Kurt": round(float(kurtosis(r)), 3),
+            "Normal?":     "No"  if sw_p  < 0.05 else "Yes",
+            "Stationary?": "Yes" if adf_p < 0.05 else "No",
+            "Fat Tails?":  "Yes" if abs(float(kurtosis(r))) > 1 else "No",
+        }
+    df = pd.DataFrame(results).T
+    print(df.to_string())
+    print()
+    print("  Normal?=No  -> fat tails exist; GBM underestimates crash risk.")
+    print("  Fat Tails?  -> GBM VaR is too optimistic.")
+    return df
+
+
+def plot_diagnostics(log_returns):
+    n    = len(log_returns.columns)
+    fig, axes = plt.subplots(n, 3, figsize=(18, 5 * n))
+    if n == 1:
+        axes = axes[np.newaxis, :]
+
+    for i, col in enumerate(log_returns.columns):
+        r    = log_returns[col].dropna()
+        conf = 1.96 / np.sqrt(len(r))
+
+        probplot(r, dist="norm", plot=axes[i, 0])
+        axes[i, 0].set_title(f"{col} -- QQ Plot (vs Normal)")
+        axes[i, 0].get_lines()[0].set(color=PALETTE[0], markersize=2, alpha=0.5)
+        axes[i, 0].get_lines()[1].set(color="red", lw=1.5)
+
+        rv = r.rolling(30).std() * np.sqrt(252)
+        rv.plot(ax=axes[i, 1], color=PALETTE[1])
+        axes[i, 1].set_title(f"{col} -- Rolling 30d Vol (Ann.)")
+        axes[i, 1].axhline(rv.mean(), ls="--", color="black", lw=1, label="Mean")
+        axes[i, 1].legend()
+
+        sq_acf = acf(r**2, nlags=30, fft=True)
+        axes[i, 2].bar(range(len(sq_acf)), sq_acf, color=PALETTE[2], alpha=0.7)
+        axes[i, 2].axhline(0,      color="black", lw=0.8)
+        axes[i, 2].axhline( conf,  ls="--", color="red", lw=1)
+        axes[i, 2].axhline(-conf,  ls="--", color="red", lw=1)
+        axes[i, 2].set_title(f"{col} -- ACF Squared Returns (Vol Clustering)")
+        axes[i, 2].set_xlabel("Lag")
+
+    plt.tight_layout()
+    plt.savefig("diagnostics_panel.png", bbox_inches="tight")
+    plt.show()
+    print("  Saved: diagnostics_panel.png")
+
+# Feature Engineering
+
+FEATURE_COLS = [
+    "lag1", "lag2", "lag3", "lag4", "lag5",
+    "mom_5", "mom_21",
+    "vol_10", "vol_21",
+    "skew_21",
+    "gbm_expected",
+]
+
+def build_features(log_returns, horizon=5):
+    datasets = {}
+    for col in log_returns.columns:
+        r  = log_returns[col].dropna().copy()
+        df = pd.DataFrame({"ret": r})
+
+        for lag in range(1, 6):
+            df[f"lag{lag}"] = df["ret"].shift(lag)
+
+        df["mom_5"]   = df["ret"].shift(1).rolling(5).sum()
+        df["mom_21"]  = df["ret"].shift(1).rolling(21).sum()
+        df["vol_10"]  = df["ret"].shift(1).rolling(10).std()
+        df["vol_21"]  = df["ret"].shift(1).rolling(21).std()
+        df["skew_21"] = df["ret"].shift(1).rolling(21).skew()
+
+        roll_mu    = df["ret"].shift(1).rolling(63).mean() * 252
+        roll_sigma = df["ret"].shift(1).rolling(63).std()  * np.sqrt(252)
+        df["gbm_expected"] = (roll_mu - 0.5 * roll_sigma**2) / 252
+
+        df[f"target_{horizon}d"] = (
+            df["ret"].shift(-horizon).rolling(horizon).sum()
+        )
+        df.dropna(inplace=True)
+        datasets[col] = df
+
+    return datasets
+
+# Forecasting
+
+def build_models():
+    return {
+        "Ridge": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model",  Ridge(alpha=1.0)),
+        ]),
+        "RandomForest": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model",  RandomForestRegressor(
+                n_estimators=200, max_depth=4,
+                min_samples_leaf=20, random_state=CFG.seed, n_jobs=-1,
+            )),
+        ]),
+        "GradBoost": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model",  GradientBoostingRegressor(
+                n_estimators=200, max_depth=3, learning_rate=0.05,
+                subsample=0.8, random_state=CFG.seed,
+            )),
+        ]),
+    }
+
+
+def walk_forward_forecast(dataset, asset_name, horizon, train_win):
+    target_col = f"target_{horizon}d"
+    X = dataset[FEATURE_COLS]
+    y = dataset[target_col]
+    n = len(dataset)
+
+    models  = build_models()
+    results = []
+
+    print(f"\n  Walk-forward: {asset_name}  |  window={train_win}d  |  horizon={horizon}d")
+    for t in range(train_win, n - horizon):
+        Xtr = X.iloc[t - train_win: t]
+        ytr = y.iloc[t - train_win: t]
+        row = {
+            "date":   dataset.index[t],
+            "actual": y.iloc[t],
+            "Naive":  float(ytr.mean()),
+            "GBM":    float(Xtr["gbm_expected"].iloc[-1]),
+        }
+        for name, pipe in models.items():
+            pipe.fit(Xtr, ytr)
+            row[name] = float(pipe.predict(X.iloc[[t]])[0])
+        results.append(row)
+
+    return pd.DataFrame(results).set_index("date")
+
+
+def evaluate_forecasts(results, asset_name):
+    model_cols = [c for c in results.columns if c != "actual"]
+    rows = []
+    for m in model_cols:
+        pred = results[m]
+        act  = results["actual"]
+        rows.append({
+            "Model":     m,
+            "MAE":       round(mean_absolute_error(act, pred), 6),
+            "RMSE":      round(np.sqrt(mean_squared_error(act, pred)), 6),
+            "Dir. Acc.": round(float(np.mean(np.sign(pred) == np.sign(act))), 4),
+        })
+    df = pd.DataFrame(rows).set_index("Model")
+    print(f"\n  Forecast Metrics -- {asset_name}:")
+    print(df.to_string())
+    return df
+
+# Backtesting
+
+def run_backtest(actual_returns, predictions, tc=0.001, threshold=0.0):
+    """Long/flat with transaction costs. Signal lagged by 1 day."""
+    sig     = (predictions > threshold).astype(int)
+    sig_lag = sig.shift(1).fillna(0)
+    strat   = sig_lag * actual_returns - tc * sig_lag.diff().abs().fillna(0)
+    return (1 + strat).cumprod()
+
+
+def backtest_all_models(fc, tc, threshold):
+    curves = {"Buy & Hold": (1 + fc["actual"]).cumprod()}
+    for m in [c for c in fc.columns if c != "actual"]:
+        curves[m] = run_backtest(fc["actual"], fc[m], tc, threshold)
+    return curves
+
+#Reporting
+def performance_metrics(equity, rf=0.04):
+    ann  = 252
+    rets = equity.pct_change().dropna()
+    ar   = rets.mean() * ann
+    av   = rets.std()  * np.sqrt(ann)
+    sr   = (ar - rf) / av if av > 0 else float("nan")
+    down = rets[rets < 0].std() * np.sqrt(ann)
+    so   = (ar - rf) / down if down > 0 else float("nan")
+    dd   = ((equity - equity.cummax()) / equity.cummax()).min()
+    cal  = ar / abs(dd) if dd != 0 else float("nan")
+    return {
+        "Ann. Return":  round(ar,  4),
+        "Ann. Vol":     round(av,  4),
+        "Sharpe":       round(sr,  3),
+        "Sortino":      round(so,  3),
+        "Max DD":       round(dd,  4),
+        "Calmar":       round(cal, 3),
+        "Hit Rate":     round(float((rets > 0).mean()), 3),
+        "Total Return": round(float(equity.iloc[-1] - 1), 4),
+    }
+
+
+def performance_report(curves, asset_name):
+    df = pd.DataFrame({k: performance_metrics(v) for k, v in curves.items()}).T
+    print(f"\n-- Phase G: Performance Report -- {asset_name} -----------------")
+    print(df.to_string())
+    return df
+
+
+def plot_equity_curves(curves, asset_name):
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(16, 10), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    style = {
+        "Buy & Hold":   ("-",  2.5),
+        "Naive":        ("--", 1.2),
+        "GBM":          (":",  1.2),
+        "Ridge":        ("-",  1.5),
+        "RandomForest": ("-",  2.0),
+        "GradBoost":    ("-",  2.0),
+    }
+    for i, (name, eq) in enumerate(curves.items()):
+        ls, lw = style.get(name, ("-", 1.2))
+        col    = PALETTE[i % len(PALETTE)]
+        eq.plot(ax=ax1, label=name, lw=lw, ls=ls, color=col)
+        ((eq - eq.cummax()) / eq.cummax()).plot(ax=ax2, lw=0.8,
+                                                color=col, alpha=0.7)
+
+    ax1.set_title(f"Equity Curves -- {asset_name}", fontsize=14)
+    ax1.set_ylabel("Portfolio Value (start=1)")
+    ax1.axhline(1, ls=":", color="black", lw=0.8)
+    ax1.legend(fontsize=9)
+    ax2.set_title("Drawdowns")
+    ax2.axhline(0, ls=":", color="black", lw=0.8)
+
+    plt.tight_layout()
+    plt.savefig(f"equity_{asset_name.replace(' ', '_')}.png", bbox_inches="tight")
+    plt.show()
+    print(f"  Saved: equity_{asset_name.replace(' ', '_')}.png")
+
+
+def plot_cross_asset_sharpe(all_reports):
+    assets = list(all_reports.keys())
+    models = list(all_reports[assets[0]].index)
+    x      = np.arange(len(models))
+    width  = 0.8 / len(assets)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    for i, asset in enumerate(assets):
+        sharpes = all_reports[asset]["Sharpe"].astype(float)
+        ax.bar(x + i * width, sharpes, width, label=asset,
+               color=PALETTE[i % len(PALETTE)], alpha=0.85, edgecolor="white")
+
+    ax.set_xticks(x + width * (len(assets) - 1) / 2)
+    ax.set_xticklabels(models, rotation=15)
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_title("Sharpe Ratio -- All Assets & Models", fontsize=14)
+    ax.set_ylabel("Sharpe Ratio")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("cross_asset_sharpe.png", bbox_inches="tight")
+    plt.show()
+    print("  Saved: cross_asset_sharpe.png")
+
+
+
+#  Combined
+def main():
+    print("=" * 72)
+    print("  GBM QUANTITATIVE RESEARCH PROJECT")
+    print("=" * 72)
+
+    # Phase A
+    print("\n[Phase A] Downloading data...")
+    prices = download_prices(CFG.tickers, CFG.start_date, CFG.end_date)
+    _, log_rets = compute_returns(prices)
+    data_summary(prices, log_rets)
+
+    # Phase B -- collect all sims, then plot in ONE combined figure
+    print("\n[Phase B] GBM simulations...")
+    simulations = []
+    for col in prices.columns:
+        mu, sigma = estimate_gbm_params(log_rets[col])
+        s_0       = float(prices[col].iloc[-1])
+        paths     = gbm_engine(s_0, mu, sigma, CFG.n_years_sim,
+                               CFG.n_scenarios, CFG.steps_per_year)
+        print(f"  {col}: mu={mu:.2%}, sigma={sigma:.2%}, S0={s_0:.2f}")
+        simulations.append({
+            "price_paths": paths,
+            "asset_name":  col,
+            "s_0":         s_0,
+            "mu":          mu,
+            "sigma":       sigma,
+        })
+
+    plot_gbm_all_assets(simulations)  # single figure, all assets
+
+    # Phase C
+    print("\n[Phase C] Diagnostics...")
+    run_diagnostics(log_rets)
+    plot_diagnostics(log_rets)
+
+    # Phase D
+    print("\n[Phase D] Building features...")
+    datasets = build_features(log_rets, horizon=CFG.prediction_horizon)
+
+    # Phases E / F / G
+    all_reports = {}
+    for asset_name, dataset in datasets.items():
+        print(f"\n{'=' * 60}")
+        print(f"  {asset_name}")
+        print(f"{'=' * 60}")
+        fc      = walk_forward_forecast(dataset, asset_name,
+                                        CFG.prediction_horizon, CFG.train_window)
+        evaluate_forecasts(fc, asset_name)
+        curves  = backtest_all_models(fc, CFG.transaction_cost,
+                                      CFG.signal_threshold)
+        plot_equity_curves(curves, asset_name)
+        all_reports[asset_name] = performance_report(curves, asset_name)
+
+    plot_cross_asset_sharpe(all_reports)
+
+    print("\n" + "=" * 72)
+    print("  PIPELINE COMPLETE")
+    print("  Outputs: gbm_all_assets.png, diagnostics_panel.png,")
+    print("           equity_*.png, cross_asset_sharpe.png")
+    print()
+    print("  Key findings:")
+    print("  1. Diagnostics show real returns are NOT normal (fat tails).")
+    print("     GBM VaR is too optimistic.")
+    print("  2. ACF of squared returns shows volatility clustering GBM misses.")
+    print("  3. 10bps transaction costs quickly erode ML alpha.")
+    print("  4. Next step: GARCH(1,1) to replace GBM's constant sigma.")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    main()
